@@ -11,6 +11,7 @@ import { initGeo, cleanIp } from './geo.js';
 import { classify, signatureOf, parseScannerResult } from './scanner.js';
 import { attachIo, recordEvent } from './events.js';
 import { startSimulator } from './simulate.js';
+import { redTeamRouter } from './redteam.js';
 
 const app = express();
 app.set('trust proxy', config.trustProxy);
@@ -153,6 +154,9 @@ api.get('/logs.csv', async (req, res, next) => {
 
 app.use('/api', api);
 app.options('/api/*', cors(corsOptions));
+
+// Red Team: engagements, ownership verification, the scope/approval gate, scans + reports.
+app.use('/v1/redteam', cors(), redTeamRouter);
 
 app.use((err, _req, res, _next) => {
   console.error('[api]', err);
