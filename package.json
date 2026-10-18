@@ -1,0 +1,23 @@
+{
+  "name": "offense-ai-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "migrate": "node --env-file-if-exists=.env src/migrate.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "d3-geo": "^3.1.1",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "maxmind": "^4.3.24",
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.1"
+  }
+}
