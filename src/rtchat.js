@@ -18,7 +18,7 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
 
 async function loadEngagement(id) {
   const { rows } = await pool.query(
-    `select id, domain, scope, ownership_verified, review_status
+    `select id, domain, ownership_verified, review_status
        from engagements where id = $1`, [id]);
   return rows[0] || null;
 }
