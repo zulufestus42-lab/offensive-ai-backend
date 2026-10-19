@@ -23,6 +23,13 @@ const base = (config.scannerUrl || '').replace(/\/v1\/scan\/?$/, '');
 const CRAWLER_URL = process.env.CRAWLER_URL || (base ? `${base}/v1/crawler/scan` : '');
 const REPORT_URL = process.env.REPORT_URL || (base ? `${base}/v1/report/generate` : '');
 
+// Email (Resend) for human review of authorization requests.
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const REVIEW_EMAIL = process.env.REVIEW_EMAIL || 'zulufestus42@gmail.com';
+const RESEND_FROM = process.env.RESEND_FROM || 'Offensive AI <onboarding@resend.dev>';
+// Absolute base for the approve/reject links in the email (falls back to the request host).
+const PUBLIC_BASE = (process.env.PUBLIC_BASE || '').replace(/\/$/, '');
+
 // ---- schema (self-migrating on import) ------------------------------------
 const ready = pool
   .query(`
@@ -45,8 +52,12 @@ const ready = pool
       verified_at    TIMESTAMPTZ,
       review_status  TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | rejected
       reviewed_at    TIMESTAMPTZ,
-      reviewer_note  TEXT
+      reviewer_note  TEXT,
+      review_token   TEXT,
+      pdf_name       TEXT
     );
+    ALTER TABLE engagements ADD COLUMN IF NOT EXISTS review_token TEXT;
+    ALTER TABLE engagements ADD COLUMN IF NOT EXISTS pdf_name TEXT;
     CREATE TABLE IF NOT EXISTS scans (
       id            BIGSERIAL PRIMARY KEY,
       engagement_id BIGINT NOT NULL REFERENCES engagements(id) ON DELETE CASCADE,
@@ -90,7 +101,7 @@ const safeEq = (a, b) => {
 const bearer = (req) => (req.get('authorization') ?? '').replace(/^Bearer\s+/i, '');
 const requireAdmin = (req, res, next) => (safeEq(bearer(req), ADMIN_TOKEN) ? next() : res.status(401).json({ error: 'admin only' }));
 
-const host = (s) => {
+export const host = (s) => {
   if (!s) return '';
   try {
     return new URL(s.includes('://') ? s : `https://${s}`).hostname.toLowerCase();
@@ -104,7 +115,7 @@ const inList = (h, list) => (list || []).some((e) => {
 });
 
 /** The GATE. Returns { ok } or { ok:false, reason }. */
-function gate(e, target) {
+export function gate(e, target) {
   if (!e) return { ok: false, reason: 'engagement not found' };
   if (!e.ownership_verified) return { ok: false, reason: 'domain ownership not verified' };
   if (e.review_status !== 'approved') return { ok: false, reason: `engagement is ${e.review_status}, not approved` };
@@ -128,9 +139,78 @@ async function checkDnsOwnership(domain, tok) {
   }
 }
 
-async function getEngagement(id) {
+export async function getEngagement(id) {
   const { rows } = await pool.query('SELECT * FROM engagements WHERE id = $1', [id]);
   return rows[0] || null;
+}
+
+const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Email the authorization request to the human reviewer, with the signed PDF
+// attached and one-click approve / reject links carrying a secret token.
+async function sendReviewEmail({ engagement, pdfName, pdfBase64, origin }) {
+  if (!RESEND_API_KEY) return { sent: false, reason: 'RESEND_API_KEY not set' };
+  const root = PUBLIC_BASE || origin || '';
+  const link = (d) =>
+    `${root}/v1/redteam/engagements/${engagement.id}/decide?d=${d}&t=${engagement.review_token}`;
+  const row = (k, v) => `<tr><td style="padding:4px 14px 4px 0;color:#8a8a8a">${esc(k)}</td><td style="padding:4px 0;color:#111">${esc(v) || '—'}</td></tr>`;
+  const html = `
+    <div style="font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;color:#111">
+      <div style="font-family:ui-monospace,monospace;font-size:12px;letter-spacing:.08em;color:#D92D20">OFFENSIVE AI · RED TEAM</div>
+      <h2 style="margin:8px 0 4px;font-size:20px">Authorization request to review</h2>
+      <p style="color:#555;font-size:14px;margin:0 0 18px">A client has requested authorization for active security testing. Review the attached signed authorization, then approve or reject below.</p>
+      <table style="font-size:14px;border-collapse:collapse;margin-bottom:20px">
+        ${row('Engagement', `#${engagement.id}`)}
+        ${row('Organization', engagement.org_name)}
+        ${row('Primary domain', engagement.domain)}
+        ${row('Signer', `${engagement.signer_name || ''} ${engagement.signer_role ? '· ' + engagement.signer_role : ''}`)}
+        ${row('Signer email', engagement.signer_email)}
+        ${row('Testing window', engagement.window_text)}
+        ${row('Intensity', engagement.intensity)}
+        ${row('Ownership verified', engagement.ownership_verified ? 'yes' : 'not yet')}
+      </table>
+      <div>
+        <a href="${link('approve')}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:12px 22px;border-radius:9px;margin-right:10px">Approve testing</a>
+        <a href="${link('reject')}" style="display:inline-block;background:#fff;color:#D92D20;border:1px solid #E0B4AF;text-decoration:none;font-weight:600;font-size:14px;padding:12px 22px;border-radius:9px">Reject</a>
+      </div>
+      <p style="color:#999;font-size:12px;margin:20px 0 0">Approving only clears the human-review lock. A scan still runs only once domain ownership is verified too. This request is logged against engagement #${engagement.id}.</p>
+    </div>`;
+
+  const payload = {
+    from: RESEND_FROM,
+    to: [REVIEW_EMAIL],
+    subject: `Red Team authorization — ${engagement.domain} (#${engagement.id})`,
+    html,
+  };
+  if (pdfBase64) {
+    payload.attachments = [{ filename: pdfName || `authorization-${engagement.id}.pdf`, content: pdfBase64 }];
+  }
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) return { sent: false, reason: d?.message || `resend ${r.status}` };
+    return { sent: true, id: d?.id };
+  } catch (e) {
+    return { sent: false, reason: e.message };
+  }
+}
+
+// Minimal styled confirmation page for the email approve/reject links.
+function decisionPage(title, message, ok = true) {
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${esc(title)}</title>
+  <div style="font-family:system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0A0A0A;color:#F2F2F2;margin:0">
+    <div style="max-width:420px;padding:40px 32px;text-align:center">
+      <div style="font-family:ui-monospace,monospace;font-size:12px;letter-spacing:.08em;color:${ok ? '#5AC47E' : '#E5484D'}">OFFENSIVE AI · RED TEAM</div>
+      <h1 style="font-size:22px;margin:14px 0 8px">${esc(title)}</h1>
+      <p style="color:#A3A3A3;font-size:14px;line-height:1.6;margin:0">${esc(message)}</p>
+    </div>
+  </div>`;
 }
 
 // ---- routes ----------------------------------------------------------------
@@ -143,11 +223,13 @@ redTeamRouter.post('/engagements', async (req, res, next) => {
     const b = req.body ?? {};
     if (!b.domain) return res.status(400).json({ error: 'domain is required' });
     const vt = token();
+    const rvt = token(); // secret token for the email approve/reject links
+    const pdfName = b.pdfName ? String(b.pdfName).slice(0, 180) : null;
     const { rows } = await pool.query(
       `INSERT INTO engagements
          (org_name, domain, scope_in, scope_out, signer_name, signer_role, signer_email,
-          contact_email, intensity, window_text, verify_method, verify_token)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          contact_email, intensity, window_text, verify_method, verify_token, review_token, pdf_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING id, domain, verify_method, verify_token, ownership_verified, review_status, created_at`,
       [
         b.orgName ?? null, host(b.domain),
@@ -155,12 +237,34 @@ redTeamRouter.post('/engagements', async (req, res, next) => {
         Array.isArray(b.scopeOut) ? b.scopeOut : (b.scopeOut ? String(b.scopeOut).split(/[\n,]/).map((s) => s.trim()).filter(Boolean) : []),
         b.signerName ?? null, b.signerRole ?? null, b.signerEmail ?? null,
         b.contactEmail ?? b.signerEmail ?? null, b.intensity ?? 'safe', b.window ?? null,
-        b.verifyMethod ?? 'dns', vt,
+        b.verifyMethod ?? 'dns', vt, rvt, pdfName,
       ],
     );
     const e = rows[0];
+
+    // Email the signed authorization to the human reviewer (never blocks on failure).
+    const origin = `${req.protocol}://${req.get('host')}`;
+    const emailResult = await sendReviewEmail({
+      engagement: {
+        id: e.id,
+        domain: e.domain,
+        review_token: rvt,
+        org_name: b.orgName,
+        signer_name: b.signerName,
+        signer_role: b.signerRole,
+        signer_email: b.signerEmail,
+        window_text: b.window,
+        intensity: b.intensity ?? 'safe',
+        ownership_verified: false,
+      },
+      pdfName,
+      pdfBase64: b.pdfBase64 || null,
+      origin,
+    });
+
     res.status(201).json({
       ...e,
+      review_email: emailResult,
       verification: {
         method: 'dns',
         record: `_offai-verify.${e.domain}`,
@@ -250,6 +354,37 @@ redTeamRouter.post('/admin/engagements/:id/force-verify', requireAdmin, async (r
     );
     if (!rows[0]) return res.status(404).json({ error: 'not found' });
     res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// One-click approve / reject from the review email. Auth is the per-engagement
+// secret token in the link — not the admin bearer — so the reviewer can act
+// straight from their inbox. Returns a human-readable confirmation page.
+redTeamRouter.get('/engagements/:id/decide', async (req, res, next) => {
+  try {
+    await ready;
+    const e = await getEngagement(req.params.id);
+    if (!e) return res.status(404).type('html').send(decisionPage('Not found', 'This engagement no longer exists.', false));
+    if (!e.review_token || !safeEq(String(req.query.t || ''), e.review_token)) {
+      return res.status(403).type('html').send(decisionPage('Invalid link', 'This approval link is invalid or has already been superseded.', false));
+    }
+    const d = String(req.query.d || '').toLowerCase();
+    if (d !== 'approve' && d !== 'reject') {
+      return res.status(400).type('html').send(decisionPage('Unknown action', 'This link did not specify a valid decision.', false));
+    }
+    const status = d === 'approve' ? 'approved' : 'rejected';
+    await pool.query(
+      `UPDATE engagements SET review_status = $1, reviewed_at = now(),
+         reviewer_note = COALESCE(reviewer_note,'') || $2 WHERE id = $3`,
+      [status, ` [email-${status} ${new Date().toISOString()}]`, e.id],
+    );
+    const msg =
+      status === 'approved'
+        ? `Engagement #${e.id} for ${e.domain} is approved. Scanning will unlock once domain ownership is also verified.`
+        : `Engagement #${e.id} for ${e.domain} is rejected. Scanning stays locked.`;
+    res.type('html').send(decisionPage(status === 'approved' ? 'Approved' : 'Rejected', msg, status === 'approved'));
   } catch (err) {
     next(err);
   }
