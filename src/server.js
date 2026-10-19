@@ -1,3 +1,4 @@
+import { rtChatRouter } from './rtchat.js';
 import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import express from 'express';
