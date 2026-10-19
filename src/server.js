@@ -12,11 +12,12 @@ import { classify, signatureOf, parseScannerResult } from './scanner.js';
 import { attachIo, recordEvent } from './events.js';
 import { startSimulator } from './simulate.js';
 import { redTeamRouter } from './redteam.js';
+import { handleAnalyst } from './analyst.js';
 
 const app = express();
 app.set('trust proxy', config.trustProxy);
 app.disable('x-powered-by');
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({ limit: '15mb' })); // room for a base64 authorization PDF on Red Team requests
 app.use((_req, res, next) => {
   res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY' });
   next();
@@ -151,6 +152,9 @@ api.get('/logs.csv', async (req, res, next) => {
     next(e);
   }
 });
+
+// SOC Analyst — plain-language Q&A grounded in the live events (Groq + DB).
+api.post('/analyst', (req, res, next) => handleAnalyst(req, res).catch(next));
 
 app.use('/api', api);
 app.options('/api/*', cors(corsOptions));
