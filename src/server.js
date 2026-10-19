@@ -12,6 +12,8 @@ import { classify, signatureOf, parseScannerResult } from './scanner.js';
 import { attachIo, recordEvent } from './events.js';
 import { startSimulator } from './simulate.js';
 import { redTeamRouter } from './redteam.js';
+import { autopilotRouter, attachAutopilotIo } from './autopilot.js';
+import { wafRouter } from './waf.js';
 import { handleAnalyst } from './analyst.js';
 
 const app = express();
@@ -161,6 +163,10 @@ app.options('/api/*', cors(corsOptions));
 
 // Red Team: engagements, ownership verification, the scope/approval gate, scans + reports.
 app.use('/v1/redteam', cors(), redTeamRouter);
+// Red Team Autopilot: the autonomous, gated pentest loop (streams over the socket).
+app.use('/v1/redteam', cors(), autopilotRouter);
+// Inline reverse-proxy WAF for verified customer origins: /waf/<engagementId>/<path>
+app.use('/waf', cors(), wafRouter);
 
 app.use((err, _req, res, _next) => {
   console.error('[api]', err);
@@ -173,12 +179,21 @@ const io = new Server(server, { cors: { origin: config.corsOrigins } });
 io.use((socket, next) =>
   safeEqual(socket.handshake.auth?.token, config.dashboardToken) ? next() : next(new Error('unauthorized')),
 );
-io.on('connection', (socket) => socket.join('dashboard'));
+io.on('connection', (socket) => {
+  socket.join('dashboard');
+  // Let a client follow one engagement's autopilot run.
+  socket.on('autopilot:watch', (id) => {
+    if (id !== undefined && id !== null) socket.join(`autopilot:${id}`);
+  });
+});
 attachIo(io);
+attachAutopilotIo(io);
 
 await migrate();
 await initGeo();
 server.listen(config.port, () => {
   console.log(`[server] listening on :${config.port}`);
-  if (config.demoMode) startSimulator();
+  // Sample-traffic generator is hard-disabled — only real attacks are stored.
+  // To re-enable demo traffic later, restore: if (config.demoMode) startSimulator();
+  void startSimulator;
 });
