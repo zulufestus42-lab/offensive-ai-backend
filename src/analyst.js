@@ -7,9 +7,9 @@
 import { overview, listEvents } from './db.js';
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-// Override with GROQ_MODEL if Groq retires this one. llama-3.3-70b-versatile is a
-// current, strong chat model; llama-3.1-8b-instant is the faster/cheaper option.
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+// Override with GROQ_MODEL if Groq retires this one. This is the same model the
+// FastAPI scanner uses; llama-3.3-70b-versatile gives richer answers if available.
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 
 function buildContext(ov, rows) {
   const k = ov.kpis;
@@ -64,31 +64,42 @@ function fallbackAnswer(ctx) {
   return `${verdict}\n\n${parts.join(' ')}`;
 }
 
-async function askGroq(question, ctx) {
+const SYSTEM_PROMPT = [
+  'You are "Analyst", a calm, friendly security assistant built into the Offensive AI dashboard.',
+  'You are talking to a business owner or executive who is NOT technical — assume they do not know security jargon.',
+  '',
+  'How to answer:',
+  '- Answer ANY question they ask, naturally and conversationally, like a knowledgeable friend. Greetings, vague questions ("are we okay?", "should I be worried?"), and specific ones all get a real reply.',
+  '- Use plain English. Avoid jargon; if you must use a term (like "payload" or "injection"), explain it in a few plain words. Never make them feel they should already know something.',
+  '- Base every FACT (numbers, countries, attack types, what got through) ONLY on the DATA block provided. Never invent figures, IPs, or events. The DATA covers the last 24 hours of traffic to their system.',
+  '- If the question is not answerable from the DATA, say what you can see and offer that, instead of refusing.',
+  '- Keep it short and human: usually 2 to 5 sentences. No markdown, no bullet points, no headings, no numbered lists. Reassure when things are fine; be clear and direct when they are not.',
+  '- You remember the earlier conversation and can answer follow-ups naturally.',
+].join('\n');
+
+function dataBlock(ctx) {
+  return `Here is the live DATA for the last ${ctx.windowLabel} — use it for all facts:\n${JSON.stringify(ctx.data)}`;
+}
+
+async function askGroq(question, ctx, history) {
   if (!GROQ_API_KEY) {
     console.warn('[analyst] GROQ_API_KEY not set — using fallback');
     return { text: fallbackAnswer(ctx), mode: 'fallback', reason: 'no-key' };
   }
-  const sys =
-    'You are a concise security operations (SOC) analyst for the "Offensive AI" dashboard. ' +
-    'Answer the user\'s question using ONLY the DATA provided — never invent numbers, IPs, countries, or events that are not in it. ' +
-    'Write 2 to 4 plain sentences: no markdown, no bullet lists, no headings. ' +
-    'Put a one-sentence verdict on the first line, then a blank line, then brief supporting detail and, if useful, one recommended action. ' +
-    'If the data shows no events, say there is no traffic in this window.';
-  const user = `QUESTION: ${question}\n\nDATA (last ${ctx.windowLabel}):\n${JSON.stringify(ctx.data)}`;
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
+  for (const h of history) {
+    const role = h.role === 'assistant' ? 'assistant' : 'user';
+    const content = String(h.content ?? h.text ?? '').slice(0, 1200);
+    if (content) messages.push({ role, content });
+  }
+  // Attach the fresh data to the current question so facts are always current.
+  messages.push({ role: 'user', content: `${question}\n\n${dataBlock(ctx)}` });
+
   try {
     const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        temperature: 0.35,
-        max_tokens: 260,
-        messages: [
-          { role: 'system', content: sys },
-          { role: 'user', content: user },
-        ],
-      }),
+      body: JSON.stringify({ model: GROQ_MODEL, temperature: 0.45, max_tokens: 320, messages }),
       signal: AbortSignal.timeout(25_000),
     });
     if (!r.ok) {
@@ -107,10 +118,19 @@ async function askGroq(question, ctx) {
 }
 
 export async function handleAnalyst(req, res) {
-  const question = String(req.body?.question || '').slice(0, 500).trim();
+  const question = String(req.body?.question || '').slice(0, 800).trim();
   if (!question) return res.status(400).json({ error: 'question is required' });
+  const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
   const [ov, rows] = await Promise.all([overview(), listEvents({ limit: 40 })]);
   const ctx = buildContext(ov, rows);
-  const result = await askGroq(question, ctx);
-  res.json({ answer: result.text, stats: ctx.chips, source: ctx.source, mode: result.mode, reason: result.reason });
+  const result = await askGroq(question, ctx, history);
+  // Stats only accompany the first answer of a conversation, so the chat stays clean.
+  const withStats = history.length === 0;
+  res.json({
+    answer: result.text,
+    stats: withStats ? ctx.chips : [],
+    source: withStats ? ctx.source : null,
+    mode: result.mode,
+    reason: result.reason,
+  });
 }
