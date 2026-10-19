@@ -14,17 +14,9 @@
 //   io.on('connection', s => s.on('autopilot:watch', id => s.join('autopilot:' + id)));
 
 import { Router } from 'express';
-import pg from 'pg';
 import { config } from './config.js';
 import { gate, getEngagement } from './redteam.js';
-
-const { Pool } = pg;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost')
-    ? false
-    : { rejectUnauthorized: false },
-});
+import { pool } from './db.js'; // reuse the app's working Neon pool
 
 const SELF = process.env.PUBLIC_BASE || `http://127.0.0.1:${config.port}`;
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
@@ -292,6 +284,7 @@ async function persist(runId, s) {
 export const autopilotRouter = Router();
 
 autopilotRouter.post('/engagements/:id/autopilot', async (req, res) => {
+ try {
   const id = req.params.id;
   const eng = await getEngagement(id);
   if (!eng) return res.status(404).json({ error: 'engagement not found' });
@@ -312,4 +305,8 @@ autopilotRouter.post('/engagements/:id/autopilot', async (req, res) => {
   });
 
   res.json({ started: true, runId, room: 'autopilot:' + id });
+ } catch (e) {
+  console.error('[autopilot]', e);
+  res.status(500).json({ error: 'autopilot failed to start', detail: String(e).slice(0, 200) });
+ }
 });

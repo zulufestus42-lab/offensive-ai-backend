@@ -9,15 +9,7 @@
 // Full route: POST /v1/redteam/engagements/:id/chat
 
 import { Router } from 'express';
-import pg from 'pg';
-
-const { Pool } = pg;
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost')
-    ? false
-    : { rejectUnauthorized: false },
-});
+import { pool } from './db.js'; // reuse the app's working Neon pool
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
@@ -131,6 +123,7 @@ async function askGroq(messages) {
 export const rtChatRouter = Router();
 
 rtChatRouter.post('/engagements/:id/chat', async (req, res) => {
+ try {
   const id = req.params.id;
   const question = (req.body?.question || req.body?.message || '').toString().slice(0, 2000);
   const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
@@ -155,13 +148,22 @@ rtChatRouter.post('/engagements/:id/chat', async (req, res) => {
   const g = await askGroq(messages);
   if (g.ok) return res.json({ answer: g.answer, mode: 'groq', model: GROQ_MODEL });
   return res.json({ answer: fallbackAnswer(ctx), mode: 'fallback', reason: g.reason });
+ } catch (e) {
+  console.error('[rtchat]', e);
+  return res.status(500).json({ error: 'chat failed', detail: String(e).slice(0, 200) });
+ }
 });
 
 // convenience: read the latest run (used by the report view / chat preload)
 rtChatRouter.get('/engagements/:id/autopilot/last', async (req, res) => {
+ try {
   const eng = await loadEngagement(req.params.id);
   if (!eng) return res.status(404).json({ error: 'engagement not found' });
   const run = await loadLatestRun(req.params.id);
   const sigs = await loadSignatures(req.params.id);
   res.json({ engagement: { id: eng.id, domain: eng.domain }, run: run || null, signatures: sigs });
+ } catch (e) {
+  console.error('[rtchat:last]', e);
+  res.status(500).json({ error: 'read failed', detail: String(e).slice(0, 200) });
+ }
 });
