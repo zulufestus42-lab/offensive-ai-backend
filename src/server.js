@@ -166,6 +166,7 @@ app.options('/api/*', cors(corsOptions));
 app.use('/v1/redteam', cors(), redTeamRouter);
 // Red Team Autopilot: the autonomous, gated pentest loop (streams over the socket).
 app.use('/v1/redteam', cors(), autopilotRouter);
+app.use('/v1/redteam', rtChatRouter);
 // Inline reverse-proxy WAF for verified customer origins: /waf/<engagementId>/<path>
 app.use('/waf', cors(), wafRouter);
 
