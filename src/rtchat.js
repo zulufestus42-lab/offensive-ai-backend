@@ -10,6 +10,7 @@
 
 import { Router } from 'express';
 import { pool } from './db.js'; // reuse the app's working Neon pool
+import { getEngagement, authorizeOwner } from './redteam.js';
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
@@ -129,8 +130,9 @@ rtChatRouter.post('/engagements/:id/chat', async (req, res) => {
   const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
   if (!question) return res.status(400).json({ error: 'question required' });
 
-  const eng = await loadEngagement(id);
-  if (!eng) return res.status(404).json({ error: 'engagement not found' });
+  const eng = await getEngagement(id);
+  const own = await authorizeOwner(req, eng);
+  if (!own.ok) return res.status(own.status).json({ error: own.reason });
 
   const run = await loadLatestRun(id);
   const sigs = await loadSignatures(id);
@@ -157,8 +159,9 @@ rtChatRouter.post('/engagements/:id/chat', async (req, res) => {
 // convenience: read the latest run (used by the report view / chat preload)
 rtChatRouter.get('/engagements/:id/autopilot/last', async (req, res) => {
  try {
-  const eng = await loadEngagement(req.params.id);
-  if (!eng) return res.status(404).json({ error: 'engagement not found' });
+  const eng = await getEngagement(req.params.id);
+  const own = await authorizeOwner(req, eng);
+  if (!own.ok) return res.status(own.status).json({ error: own.reason });
   const run = await loadLatestRun(req.params.id);
   const sigs = await loadSignatures(req.params.id);
   res.json({ engagement: { id: eng.id, domain: eng.domain }, run: run || null, signatures: sigs });

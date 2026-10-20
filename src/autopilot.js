@@ -1,4 +1,4 @@
- // autopilot.js — Autonomous Red Team engine.
+// autopilot.js — Autonomous Red Team engine.
 //
 // Fires REAL payloads at the engagement's verified domain THROUGH the inline
 // WAF reverse-proxy (/waf/:id/*). Each payload is judged blocked / bypassed /
@@ -15,7 +15,7 @@
 
 import { Router } from 'express';
 import { config } from './config.js';
-import { gate, getEngagement } from './redteam.js';
+import { gate, getEngagement, authorizeOwner } from './redteam.js';
 import { pool } from './db.js'; // reuse the app's working Neon pool
 
 const SELF = process.env.PUBLIC_BASE || `http://127.0.0.1:${config.port}`;
@@ -300,7 +300,10 @@ autopilotRouter.post('/engagements/:id/autopilot', async (req, res) => {
  try {
   const id = req.params.id;
   const eng = await getEngagement(id);
-  if (!eng) return res.status(404).json({ error: 'engagement not found' });
+
+  // Tenant isolation: only the owning customer (or operator) can run this engagement.
+  const own = await authorizeOwner(req, eng);
+  if (!own.ok) return res.status(own.status).json({ error: own.reason });
 
   // Defense in depth: the gate re-checks ownership + human approval + scope.
   const g = gate(eng, 'https://' + eng.domain);
