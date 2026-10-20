@@ -1,4 +1,4 @@
-// autopilot.js — Autonomous Red Team engine.
+ // autopilot.js — Autonomous Red Team engine.
 //
 // Fires REAL payloads at the engagement's verified domain THROUGH the inline
 // WAF reverse-proxy (/waf/:id/*). Each payload is judged blocked / bypassed /
