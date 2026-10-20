@@ -52,6 +52,19 @@ async function ensureTables() {
       technique text,
       created_at timestamptz default now()
     )`);
+  // The table may pre-exist from an older engine with a different shape.
+  // Make the columns this engine writes exist, and relax the legacy NOT NULL on target.
+  await pool.query(`
+    alter table autopilot_runs add column if not exists target text;
+    alter table autopilot_runs add column if not exists score int default 50;
+    alter table autopilot_runs add column if not exists blocked int default 0;
+    alter table autopilot_runs add column if not exists bypassed int default 0;
+    alter table autopilot_runs add column if not exists signatures int default 0;
+    alter table autopilot_runs add column if not exists findings jsonb default '[]'::jsonb;
+    alter table autopilot_runs add column if not exists transcript jsonb default '[]'::jsonb;
+    alter table autopilot_runs add column if not exists finished_at timestamptz;
+    alter table autopilot_runs alter column target drop not null;
+  `);
 }
 
 // ---- attack surface -----------------------------------------------------
@@ -295,8 +308,8 @@ autopilotRouter.post('/engagements/:id/autopilot', async (req, res) => {
 
   await ensureTables();
   const ins = await pool.query(
-    `insert into autopilot_runs (engagement_id, status) values ($1, 'running') returning id`,
-    [String(id)]);
+    `insert into autopilot_runs (engagement_id, target, status) values ($1, $2, 'running') returning id`,
+    [String(id), eng.domain]);
   const runId = ins.rows[0].id;
 
   // fire and forget — progress streams over socket room autopilot:<id>
