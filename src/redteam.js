@@ -1,4 +1,4 @@
- // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Red Team engagements: authorization, domain-ownership verification, the
 // scope/approval GATE, and gated scan + report orchestration.
 //
@@ -479,6 +479,40 @@ redTeamRouter.get('/admin/users', requireAdmin, async (_req, res, next) => {
       role: ADMIN_EMAILS.includes((u.email || '').toLowerCase()) ? 'admin' : 'customer',
     }));
     res.json({ configured: true, users });
+  } catch (err) { next(err); }
+});
+
+// Admin "Launch attack" — one atomic, operator-only call that prepares a
+// sanctioned practice target (e.g. OWASP Juice Shop) ready to run: create-or-reuse
+// the engagement for this domain, force-verify it, approve it, and audit it.
+redTeamRouter.post('/admin/targets', requireAdmin, async (req, res, next) => {
+  try {
+    await ready;
+    const domain = host(req.body?.domain);
+    if (!domain) return res.status(400).json({ error: 'domain is required' });
+    const scopeIn = Array.isArray(req.body?.scopeIn) && req.body.scopeIn.length
+      ? req.body.scopeIn.map(host) : [domain];
+
+    // Reuse an existing operator-owned (unowned) engagement for this domain if present.
+    const found = await pool.query(
+      `SELECT id FROM engagements WHERE domain = $1 AND owner_id IS NULL ORDER BY id DESC LIMIT 1`, [domain]);
+    let eid = found.rows[0]?.id;
+    if (!eid) {
+      const ins = await pool.query(
+        `INSERT INTO engagements (org_name, domain, scope_in, intensity, verify_method, verify_token, review_token)
+         VALUES ($1,$2,$3,'safe','admin',$4,$5) RETURNING id`,
+        [req.body?.orgName || 'Operator target', domain, scopeIn, token(), token()]);
+      eid = ins.rows[0].id;
+    } else {
+      await pool.query(`UPDATE engagements SET scope_in = $2 WHERE id = $1`, [eid, scopeIn]);
+    }
+    await pool.query(
+      `UPDATE engagements SET ownership_verified = true, verified_at = now(),
+         review_status = 'approved', reviewed_at = now(),
+         reviewer_note = COALESCE(reviewer_note,'') || $2 WHERE id = $1`,
+      [eid, ` [admin target-launch ${new Date().toISOString()}]`]);
+    const out = await getEngagement(eid);
+    res.json({ id: out.id, domain: out.domain, ownership_verified: out.ownership_verified, review_status: out.review_status });
   } catch (err) { next(err); }
 });
 
